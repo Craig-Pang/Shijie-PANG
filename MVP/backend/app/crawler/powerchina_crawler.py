@@ -1,19 +1,20 @@
 """
 中国电建阳光采购网爬虫
-支持自动 fallback 到 Playwright
+Pipeline: crawler -> extract -> hash去重 -> NEW/UPDATED -> analyze -> 入库
 """
 
 import re
 import asyncio
+import hashlib
 import aiohttp
 from bs4 import BeautifulSoup
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 from urllib.parse import urljoin
 
 from ..agent import analyze_notice
 from ..db import save_notice, get_notice_by_url, init_db
-from .powerchina_crawler_playwright import fetch_with_playwright
+from .powerchina_crawler_playwright import fetch_html_with_playwright, fetch_notice_list_with_playwright
 
 
 class PowerChinaCrawler:
@@ -59,7 +60,7 @@ class PowerChinaCrawler:
         if self.session:
             await self.session.close()
     
-    async def fetch_page(self, url: str, use_fallback: bool = True) -> Optional[str]:
+    async def fetch_page(self, url: str, use_fallback: bool = True) -> Optional[Tuple[str, str]]:
         """
         获取网页内容（带 fallback）
         
@@ -68,7 +69,7 @@ class PowerChinaCrawler:
             use_fallback: 是否在失败时使用 Playwright fallback
         
         返回:
-            HTML 内容
+            (html, final_url) 元组，失败返回 None
         """
         # 首先尝试 requests 方式
         print(f"[FETCH_MODE=requests] 获取页面: {url}")
@@ -77,14 +78,16 @@ class PowerChinaCrawler:
         # 检查内容是否有效
         if html and len(html) > 1000:
             print(f"[FETCH_MODE=requests] 成功获取 HTML ({len(html)} 字符)")
-            return html
+            return (html, url)
         
         # 如果失败且启用 fallback，使用 Playwright
         if (not html or len(html) <= 1000) and use_fallback and self.use_playwright_fallback:
             print(f"[FETCH_MODE=requests] 获取失败或内容为空，fallback 到 Playwright")
-            html = await fetch_with_playwright(url, headless=True, timeout=30000, retries=3)
-            if html and len(html) > 1000:
-                return html
+            result = await fetch_html_with_playwright(url, headless=True, timeout=60000, retries=2, debug=True)
+            if result:
+                html, final_url = result
+                if html and len(html) > 1000:
+                    return (html, final_url)
         
         return None
     
@@ -150,7 +153,7 @@ class PowerChinaCrawler:
         return None
     
     def parse_api_response(self, data: Dict) -> List[Dict]:
-        """解析 API 响应数据"""
+        """解析 API 响应数据，返回 [{title, url, published_at, html_or_text}]"""
         notices = []
         items = None
         
@@ -172,28 +175,43 @@ class PowerChinaCrawler:
             return notices
         
         for item in items:
-            notice = {}
-            notice['title'] = item.get('title') or item.get('noticeTitle') or item.get('name') or ''
-            notice['url'] = item.get('url') or item.get('link') or item.get('detailUrl') or ''
+            notice = {
+                'title': item.get('title') or item.get('noticeTitle') or item.get('name') or '',
+                'url': item.get('url') or item.get('link') or item.get('detailUrl') or '',
+                'published_at': None,
+                'html_or_text': item.get('content') or item.get('summary') or ''  # 如果有内容
+            }
             
             if notice['url'] and not notice['url'].startswith('http'):
                 notice['url'] = urljoin(self.BASE_URL, notice['url'])
             
+            # 解析日期
             date_field = item.get('publishDate') or item.get('createTime') or item.get('date') or item.get('publishTime') or ''
             if date_field:
-                notice['publish_date'] = str(date_field)[:10]
+                try:
+                    date_str = str(date_field)[:10]
+                    for fmt in ['%Y-%m-%d', '%Y/%m/%d']:
+                        try:
+                            notice['published_at'] = datetime.strptime(date_str, fmt)
+                            break
+                        except:
+                            continue
+                except:
+                    pass
             
             notice_id = item.get('id') or item.get('noticeId') or item.get('tenderId') or ''
             if notice_id and not notice['url']:
                 notice['url'] = f"{self.BASE_URL}/consult/notice/{notice_id}"
             
-            if notice.get('title'):
+            if notice.get('title') and notice.get('url'):
                 notices.append(notice)
         
         return notices
     
     def parse_notice_list(self, html: str) -> List[Dict]:
-        """解析招标公告列表页"""
+        """
+        解析招标公告列表页，返回 [{title, url, published_at, html_or_text}]
+        """
         soup = BeautifulSoup(html, 'html.parser')
         notices = []
         
@@ -204,7 +222,13 @@ class PowerChinaCrawler:
             if not links:
                 continue
             
-            notice = {}
+            notice = {
+                'title': '',
+                'url': '',
+                'published_at': None,
+                'html_or_text': ''
+            }
+            
             title_link = links[0]
             notice['title'] = title_link.get_text(strip=True)
             notice['url'] = urljoin(self.BASE_URL, title_link['href'])
@@ -215,7 +239,13 @@ class PowerChinaCrawler:
                 text = cell.get_text(strip=True)
                 date_match = re.search(r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})', text)
                 if date_match:
-                    notice['publish_date'] = date_match.group(1)
+                    date_str = date_match.group(1)
+                    for fmt in ['%Y-%m-%d', '%Y/%m/%d']:
+                        try:
+                            notice['published_at'] = datetime.strptime(date_str, fmt)
+                            break
+                        except:
+                            continue
                     break
             
             if notice.get('title') and notice.get('url'):
@@ -223,22 +253,22 @@ class PowerChinaCrawler:
         
         return notices
     
-    def parse_notice_detail(self, html: str, url: str) -> Dict:
-        """解析招标公告详情页"""
+    def extract_raw_text(self, html: str) -> str:
+        """
+        从 HTML 提取纯文本（extract -> raw_text）
+        
+        参数:
+            html: HTML 内容
+        
+        返回:
+            纯文本内容
+        """
         soup = BeautifulSoup(html, 'html.parser')
-        result = {
-            'url': url,
-            'title': '',
-            'raw_text': '',
-            'extracted_fields': {}
-        }
         
         # 提取标题
         title_elem = soup.find(['h1', 'h2', 'h3'], class_=re.compile(r'title|head', re.I))
         if not title_elem:
             title_elem = soup.find('title')
-        if title_elem:
-            result['title'] = title_elem.get_text(strip=True)
         
         # 提取正文内容
         content_elem = soup.find(['div', 'article', 'section'], class_=re.compile(r'content|detail|main|body', re.I))
@@ -248,79 +278,14 @@ class PowerChinaCrawler:
         if content_elem:
             for script in content_elem(["script", "style", "nav", "header", "footer"]):
                 script.decompose()
-            result['raw_text'] = content_elem.get_text(separator='\n', strip=True)
+            return content_elem.get_text(separator='\n', strip=True)
         
-        # 提取关键字段
-        extracted = {}
-        
-        # 提取地点
-        location_patterns = [
-            r'项目地点[：:]\s*([^\n]+)',
-            r'建设地点[：:]\s*([^\n]+)',
-            r'地点[：:]\s*([^\n]+)',
-            r'位于\s*([^\n]+)',
-        ]
-        for pattern in location_patterns:
-            match = re.search(pattern, result['raw_text'], re.I)
-            if match:
-                extracted['location'] = match.group(1).strip()
-                break
-        
-        # 提取吨位
-        tonnage_patterns = [
-            r'(\d+(?:\.\d+)?)\s*[吨tT]',
-            r'约\s*(\d+(?:\.\d+)?)\s*[吨tT]',
-            r'钢结构.*?(\d+(?:\.\d+)?)\s*[吨tT]',
-            r'(\d+(?:\.\d+)?)\s*吨位',
-        ]
-        for pattern in tonnage_patterns:
-            match = re.search(pattern, result['raw_text'], re.I)
-            if match:
-                extracted['tonnage'] = match.group(1) + '吨'
-                break
-        
-        # 提取截止时间
-        deadline_patterns = [
-            r'投标截止[时间]?[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2}\s*\d{1,2}:\d{2})',
-            r'截止时间[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2}\s*\d{1,2}:\d{2})',
-            r'报名截止[：:]\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})',
-            r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})\s*[前之前]',
-        ]
-        for pattern in deadline_patterns:
-            match = re.search(pattern, result['raw_text'], re.I)
-            if match:
-                extracted['deadline'] = match.group(1).strip()
-                break
-        
-        # 提取资质要求
-        qual_patterns = [
-            r'资质要求[：:]\s*([^\n]+(?:\n[^\n]+){0,3})',
-            r'资质[：:]\s*([^\n]+(?:\n[^\n]+){0,2})',
-            r'专业承包[：:]\s*([^\n]+)',
-        ]
-        for pattern in qual_patterns:
-            match = re.search(pattern, result['raw_text'], re.I)
-            if match:
-                extracted['qualification'] = match.group(1).strip()[:200]
-                break
-        
-        # 提取项目范围
-        scope_patterns = [
-            r'项目内容[：:]\s*([^\n]+(?:\n[^\n]+){0,5})',
-            r'建设内容[：:]\s*([^\n]+(?:\n[^\n]+){0,5})',
-            r'工程内容[：:]\s*([^\n]+(?:\n[^\n]+){0,5})',
-        ]
-        for pattern in scope_patterns:
-            match = re.search(pattern, result['raw_text'], re.I)
-            if match:
-                extracted['scope'] = match.group(1).strip()[:500]
-                break
-        
-        result['extracted_fields'] = extracted
-        return result
+        return ''
     
     async def crawl_notice_list(self, max_pages: int = 5) -> List[Dict]:
-        """爬取公告列表"""
+        """
+        爬取公告列表，返回 [{title, url, published_at, html_or_text}]
+        """
         all_notices = []
         
         # 尝试 API 接口
@@ -347,30 +312,67 @@ class PowerChinaCrawler:
                 if not page_notices:
                     break
         else:
+            # 首先尝试从 Playwright 获取列表（从 JS 变量）
+            if self.use_playwright_fallback:
+                js_list = await fetch_notice_list_with_playwright(
+                    self.NOTICE_LIST_URL, headless=True, timeout=60000, retries=2
+                )
+                if js_list:
+                    all_notices.extend(js_list)
+                    return all_notices
+            
             # 使用 HTML 解析（带 fallback）
             print(f"[FETCH_MODE=requests] 尝试 HTML 解析列表页...")
-            html = await self.fetch_page(self.NOTICE_LIST_URL, use_fallback=True)
-            if html:
+            result = await self.fetch_page(self.NOTICE_LIST_URL, use_fallback=True)
+            if result:
+                html, _ = result
                 notices = self.parse_notice_list(html)
                 all_notices.extend(notices)
         
         return all_notices
     
     async def crawl_notice_detail(self, notice: Dict) -> Optional[Dict]:
-        """爬取单个公告详情（带 fallback）"""
+        """
+        爬取单个公告详情，返回 {title, url, published_at, html_or_text}
+        """
         url = notice.get('url')
         if not url:
             return None
         
-        html = await self.fetch_page(url, use_fallback=True)
-        if not html:
+        # 如果已有 html_or_text，直接使用
+        if notice.get('html_or_text'):
+            return {
+                'title': notice.get('title', ''),
+                'url': url,
+                'published_at': notice.get('published_at'),
+                'html_or_text': notice.get('html_or_text')
+            }
+        
+        # 否则获取详情页
+        result = await self.fetch_page(url, use_fallback=True)
+        if not result:
             return None
         
-        detail = self.parse_notice_detail(html, url)
-        detail['title'] = detail.get('title') or notice.get('title', '')
-        detail['publish_date'] = notice.get('publish_date')
-        
-        return detail
+        html, final_url = result
+        return {
+            'title': notice.get('title', ''),
+            'url': final_url,  # 使用最终 URL（可能被重定向）
+            'published_at': notice.get('published_at'),
+            'html_or_text': html
+        }
+
+
+def calculate_content_hash(raw_text: str) -> str:
+    """
+    计算内容 hash（用于去重）
+    
+    参数:
+        raw_text: 正文内容
+    
+    返回:
+        hash 字符串
+    """
+    return hashlib.md5(raw_text.encode('utf-8')).hexdigest()
 
 
 async def crawl_and_analyze(
@@ -380,7 +382,14 @@ async def crawl_and_analyze(
     save_to_db: bool = True
 ) -> List[Dict]:
     """
-    爬取并分析招标公告，自动保存到数据库
+    完整的爬取和分析 pipeline
+    
+    Pipeline:
+    1. crawler 返回 [{title, url, published_at, html_or_text}]
+    2. extract -> raw_text
+    3. hash 去重/更新
+    4. NEW/UPDATED -> analyze_notice(...) -> analysis_json
+    5. 写入数据库
     
     参数:
         max_notices: 最大爬取数量
@@ -389,7 +398,7 @@ async def crawl_and_analyze(
         save_to_db: 是否保存到数据库
     
     返回:
-        包含分析和原始数据的列表
+        处理结果列表
     """
     # 初始化数据库
     if save_to_db:
@@ -398,6 +407,7 @@ async def crawl_and_analyze(
     results = []
     
     async with PowerChinaCrawler(delay=delay) as crawler:
+        # Step 1: 爬取列表，返回 [{title, url, published_at, html_or_text}]
         print(f"开始爬取招标公告列表...")
         notices = await crawler.crawl_notice_list(max_pages=3)
         print(f"找到 {len(notices)} 条公告")
@@ -407,67 +417,82 @@ async def crawl_and_analyze(
         for i, notice in enumerate(notices, 1):
             print(f"\n处理公告 {i}/{len(notices)}: {notice.get('title', 'N/A')[:50]}...")
             
-            # 检查是否已存在
-            if save_to_db:
-                existing = get_notice_by_url(notice.get('url', ''))
-                if existing and existing.raw_text:
-                    print(f"  公告已存在，跳过")
+            # Step 2: extract -> raw_text
+            html_or_text = notice.get('html_or_text', '')
+            if not html_or_text:
+                # 需要获取详情页
+                detail = await crawler.crawl_notice_detail(notice)
+                if not detail:
+                    print(f"  跳过：无法获取详情")
                     continue
+                html_or_text = detail.get('html_or_text', '')
+                notice['url'] = detail.get('url', notice.get('url'))
             
-            # 爬取详情
-            detail = await crawler.crawl_notice_detail(notice)
-            if not detail or not detail.get('raw_text'):
-                print(f"  跳过：无法获取详情或正文为空")
+            # 提取纯文本
+            raw_text = crawler.extract_raw_text(html_or_text) if html_or_text else ''
+            if not raw_text:
+                print(f"  跳过：无法提取正文")
                 continue
             
-            # 解析发布日期
-            published_at = None
-            if detail.get('publish_date'):
-                try:
-                    # 尝试解析日期
-                    date_str = detail['publish_date']
-                    for fmt in ['%Y-%m-%d', '%Y/%m/%d', '%Y-%m-%d %H:%M:%S']:
-                        try:
-                            published_at = datetime.strptime(date_str[:10], fmt[:10])
-                            break
-                        except:
-                            continue
-                except:
-                    pass
+            # Step 3: hash 去重/更新
+            content_hash = calculate_content_hash(raw_text)
+            existing = None
+            is_new = True
             
-            # AI 分析
+            if save_to_db:
+                existing = get_notice_by_url(notice.get('url', ''))
+                if existing:
+                    # 检查内容是否更新
+                    existing_hash = calculate_content_hash(existing.raw_text or '')
+                    if existing_hash == content_hash:
+                        print(f"  公告内容未变化，跳过")
+                        continue
+                    else:
+                        print(f"  公告内容已更新，将重新分析")
+                        is_new = False
+            
+            # Step 4: NEW/UPDATED -> analyze_notice(...) -> analysis_json
             analysis_json = None
             if analyze:
                 try:
                     print(f"  进行 AI 分析...")
                     analysis = await analyze_notice(
-                        title=detail.get('title', ''),
-                        url=detail.get('url', ''),
-                        raw_text=detail.get('raw_text', ''),
-                        extracted_fields=detail.get('extracted_fields', {})
+                        title=notice.get('title', ''),
+                        url=notice.get('url', ''),
+                        raw_text=raw_text,
+                        extracted_fields={}  # 可以进一步提取字段
                     )
                     analysis_json = analysis
-                    detail['analysis'] = analysis
                     print(f"  分析完成: {analysis.get('fit_label')} ({analysis.get('fit_score')}/100)")
                 except Exception as e:
                     print(f"  AI 分析失败: {e}")
-                    detail['analysis'] = None
+                    import traceback
+                    traceback.print_exc()
             
-            # 保存到数据库
+            # Step 5: 写入数据库
             if save_to_db:
                 try:
                     save_notice(
-                        title=detail.get('title', ''),
-                        url=detail.get('url', ''),
-                        raw_text=detail.get('raw_text', ''),
-                        published_at=published_at,
+                        title=notice.get('title', ''),
+                        url=notice.get('url', ''),
+                        raw_text=raw_text,
+                        published_at=notice.get('published_at'),
                         analysis_json=analysis_json
                     )
-                    print(f"  已保存到数据库")
+                    print(f"  已保存到数据库 ({'新建' if is_new else '更新'})")
                 except Exception as e:
                     print(f"  数据库保存失败: {e}")
+                    import traceback
+                    traceback.print_exc()
             
-            results.append(detail)
+            results.append({
+                'title': notice.get('title', ''),
+                'url': notice.get('url', ''),
+                'published_at': notice.get('published_at'),
+                'raw_text': raw_text[:200] + '...' if len(raw_text) > 200 else raw_text,
+                'analysis': analysis_json,
+                'is_new': is_new
+            })
     
     return results
 
