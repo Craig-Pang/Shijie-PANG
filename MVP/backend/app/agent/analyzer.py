@@ -80,6 +80,10 @@ async def analyze_notice(
         
         # 6. 校验 Schema
         try:
+            # 确保 fit_score 在有效范围内
+            if 'fit_score' in parsed_json:
+                parsed_json['fit_score'] = max(0, min(100, int(parsed_json['fit_score'])))
+            
             # 使用 Pydantic 校验
             validated_result = TenderAnalysisResult(**parsed_json)
             result_dict = validated_result.model_dump()
