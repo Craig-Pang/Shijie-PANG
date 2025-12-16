@@ -1,8 +1,6 @@
 """
 中国电建阳光采购网爬虫
-爬取 https://bid.powerchina.cn/consult/notice 的招标公告
-
-注意：该网站是 SPA（单页应用），需要查找 API 接口或使用浏览器渲染
+支持自动 fallback 到 Playwright
 """
 
 import re
@@ -11,9 +9,11 @@ import aiohttp
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional
 from datetime import datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 from ..agent import analyze_notice
+from ..db import save_notice, get_notice_by_url, init_db
+from .powerchina_crawler_playwright import fetch_with_playwright
 
 
 class PowerChinaCrawler:
@@ -22,7 +22,6 @@ class PowerChinaCrawler:
     BASE_URL = "https://bid.powerchina.cn"
     NOTICE_LIST_URL = "https://bid.powerchina.cn/consult/notice"
     
-    # 尝试的 API 接口路径
     API_PATHS = [
         "/api/consult/notice/list",
         "/api/notice/list",
@@ -30,16 +29,18 @@ class PowerChinaCrawler:
         "/consult/api/notice/list",
     ]
     
-    def __init__(self, delay: float = 1.0):
+    def __init__(self, delay: float = 1.0, use_playwright_fallback: bool = True):
         """
         初始化爬虫
         
         参数:
-            delay: 请求间隔（秒），避免请求过快
+            delay: 请求间隔（秒）
+            use_playwright_fallback: 是否启用 Playwright fallback
         """
         self.delay = delay
+        self.use_playwright_fallback = use_playwright_fallback
         self.session: Optional[aiohttp.ClientSession] = None
-        
+    
     async def __aenter__(self):
         """异步上下文管理器入口"""
         headers = {
@@ -58,18 +59,39 @@ class PowerChinaCrawler:
         if self.session:
             await self.session.close()
     
-    async def fetch_page(self, url: str) -> Optional[str]:
+    async def fetch_page(self, url: str, use_fallback: bool = True) -> Optional[str]:
         """
-        获取网页内容
+        获取网页内容（带 fallback）
         
         参数:
             url: 目标 URL
+            use_fallback: 是否在失败时使用 Playwright fallback
         
         返回:
-            HTML 内容，失败返回 None
+            HTML 内容
         """
+        # 首先尝试 requests 方式
+        print(f"[FETCH_MODE=requests] 获取页面: {url}")
+        html = await self._fetch_with_requests(url)
+        
+        # 检查内容是否有效
+        if html and len(html) > 1000:
+            print(f"[FETCH_MODE=requests] 成功获取 HTML ({len(html)} 字符)")
+            return html
+        
+        # 如果失败且启用 fallback，使用 Playwright
+        if (not html or len(html) <= 1000) and use_fallback and self.use_playwright_fallback:
+            print(f"[FETCH_MODE=requests] 获取失败或内容为空，fallback 到 Playwright")
+            html = await fetch_with_playwright(url, headless=True, timeout=30000, retries=3)
+            if html and len(html) > 1000:
+                return html
+        
+        return None
+    
+    async def _fetch_with_requests(self, url: str) -> Optional[str]:
+        """使用 requests 获取页面"""
         if not self.session:
-            raise RuntimeError("Session not initialized. Use 'async with' context manager.")
+            raise RuntimeError("Session not initialized.")
         
         try:
             await asyncio.sleep(self.delay)
@@ -77,23 +99,14 @@ class PowerChinaCrawler:
                 if response.status == 200:
                     return await response.text()
                 else:
-                    print(f"请求失败: {url}, 状态码: {response.status}")
+                    print(f"[FETCH_MODE=requests] 请求失败: {url}, 状态码: {response.status}")
                     return None
         except Exception as e:
-            print(f"获取页面失败 {url}: {e}")
+            print(f"[FETCH_MODE=requests] 获取页面失败 {url}: {e}")
             return None
     
     async def fetch_api(self, url: str, params: Dict = None) -> Optional[Dict]:
-        """
-        尝试调用 API 接口
-        
-        参数:
-            url: API URL
-            params: 请求参数
-        
-        返回:
-            JSON 响应，失败返回 None
-        """
+        """尝试调用 API 接口"""
         if not self.session:
             raise RuntimeError("Session not initialized.")
         
@@ -106,7 +119,6 @@ class PowerChinaCrawler:
                         return await response.json()
                     else:
                         text = await response.text()
-                        # 尝试解析为 JSON
                         try:
                             import json
                             return json.loads(text)
@@ -115,22 +127,13 @@ class PowerChinaCrawler:
                 else:
                     return None
         except Exception as e:
-            print(f"API 调用失败 {url}: {e}")
+            print(f"[FETCH_MODE=requests] API 调用失败 {url}: {e}")
             return None
     
     async def find_api_endpoint(self) -> Optional[str]:
-        """
-        尝试查找实际的 API 接口
-        
-        返回:
-            API URL 或 None
-        """
-        # 方法1: 尝试常见的 API 路径
+        """尝试查找实际的 API 接口"""
         for api_path in self.API_PATHS:
             api_url = urljoin(self.BASE_URL, api_path)
-            print(f"尝试 API: {api_url}")
-            
-            # 尝试不同的参数组合
             test_params = [
                 {'page': 1, 'pageSize': 10},
                 {'pageNo': 1, 'pageSize': 10},
@@ -140,50 +143,17 @@ class PowerChinaCrawler:
             for params in test_params:
                 result = await self.fetch_api(api_url, params)
                 if result and isinstance(result, dict):
-                    # 检查是否包含列表数据
                     if 'data' in result or 'list' in result or 'records' in result:
-                        print(f"找到 API 接口: {api_url}")
-                        return api_url
-        
-        # 方法2: 从主页面查找 API 调用
-        html = await self.fetch_page(self.NOTICE_LIST_URL)
-        if html:
-            # 查找 JavaScript 中的 API 调用
-            api_patterns = [
-                r'["\']([^"\']*api[^"\']*notice[^"\']*)["\']',
-                r'["\']([^"\']*api[^"\']*list[^"\']*)["\']',
-                r'url:\s*["\']([^"\']*api[^"\']*)["\']',
-            ]
-            
-            for pattern in api_patterns:
-                matches = re.findall(pattern, html, re.I)
-                for match in matches:
-                    if match.startswith('http'):
-                        api_url = match
-                    else:
-                        api_url = urljoin(self.BASE_URL, match)
-                    
-                    print(f"从页面找到可能的 API: {api_url}")
-                    result = await self.fetch_api(api_url)
-                    if result:
+                        print(f"[FETCH_MODE=requests] 找到 API 接口: {api_url}")
                         return api_url
         
         return None
     
     def parse_api_response(self, data: Dict) -> List[Dict]:
-        """
-        解析 API 响应数据
-        
-        参数:
-            data: API 返回的 JSON 数据
-        
-        返回:
-            公告列表
-        """
+        """解析 API 响应数据"""
         notices = []
-        
-        # 尝试不同的数据结构
         items = None
+        
         if 'data' in data:
             if isinstance(data['data'], list):
                 items = data['data']
@@ -203,24 +173,18 @@ class PowerChinaCrawler:
         
         for item in items:
             notice = {}
-            
-            # 尝试提取常见字段
             notice['title'] = item.get('title') or item.get('noticeTitle') or item.get('name') or ''
             notice['url'] = item.get('url') or item.get('link') or item.get('detailUrl') or ''
             
-            # 构建完整 URL
             if notice['url'] and not notice['url'].startswith('http'):
                 notice['url'] = urljoin(self.BASE_URL, notice['url'])
             
-            # 提取日期
             date_field = item.get('publishDate') or item.get('createTime') or item.get('date') or item.get('publishTime') or ''
             if date_field:
-                notice['publish_date'] = str(date_field)[:10]  # 取前10个字符（日期部分）
+                notice['publish_date'] = str(date_field)[:10]
             
-            # 提取 ID（用于构建详情 URL）
             notice_id = item.get('id') or item.get('noticeId') or item.get('tenderId') or ''
             if notice_id and not notice['url']:
-                # 尝试构建详情 URL
                 notice['url'] = f"{self.BASE_URL}/consult/notice/{notice_id}"
             
             if notice.get('title'):
@@ -229,15 +193,7 @@ class PowerChinaCrawler:
         return notices
     
     def parse_notice_list(self, html: str) -> List[Dict]:
-        """
-        解析招标公告列表页（传统 HTML 解析，用于非 SPA 页面）
-        
-        参数:
-            html: 列表页 HTML
-        
-        返回:
-            公告信息列表
-        """
+        """解析招标公告列表页"""
         soup = BeautifulSoup(html, 'html.parser')
         notices = []
         
@@ -268,16 +224,7 @@ class PowerChinaCrawler:
         return notices
     
     def parse_notice_detail(self, html: str, url: str) -> Dict:
-        """
-        解析招标公告详情页
-        
-        参数:
-            html: 详情页 HTML
-            url: 公告 URL
-        
-        返回:
-            提取的字段字典
-        """
+        """解析招标公告详情页"""
         soup = BeautifulSoup(html, 'html.parser')
         result = {
             'url': url,
@@ -305,7 +252,6 @@ class PowerChinaCrawler:
         
         # 提取关键字段
         extracted = {}
-        full_text = result['raw_text'].lower()
         
         # 提取地点
         location_patterns = [
@@ -371,28 +317,17 @@ class PowerChinaCrawler:
                 break
         
         result['extracted_fields'] = extracted
-        
         return result
     
     async def crawl_notice_list(self, max_pages: int = 5) -> List[Dict]:
-        """
-        爬取公告列表
-        
-        参数:
-            max_pages: 最大爬取页数
-        
-        返回:
-            公告列表
-        """
+        """爬取公告列表"""
         all_notices = []
         
-        # 首先尝试查找 API 接口
-        print("尝试查找 API 接口...")
+        # 尝试 API 接口
         api_url = await self.find_api_endpoint()
         
         if api_url:
-            # 使用 API 接口
-            print(f"使用 API 接口: {api_url}")
+            print(f"[FETCH_MODE=requests] 使用 API 接口: {api_url}")
             for page in range(1, max_pages + 1):
                 params_list = [
                     {'page': page, 'pageSize': 20},
@@ -400,20 +335,21 @@ class PowerChinaCrawler:
                     {'current': page, 'size': 20},
                 ]
                 
+                page_notices = []
                 for params in params_list:
                     data = await self.fetch_api(api_url, params)
                     if data:
-                        notices = self.parse_api_response(data)
-                        if notices:
-                            all_notices.extend(notices)
+                        page_notices = self.parse_api_response(data)
+                        if page_notices:
+                            all_notices.extend(page_notices)
                             break
                 
-                if not notices:
-                    break  # 没有更多数据
+                if not page_notices:
+                    break
         else:
-            # 回退到 HTML 解析
-            print("未找到 API 接口，尝试 HTML 解析...")
-            html = await self.fetch_page(self.NOTICE_LIST_URL)
+            # 使用 HTML 解析（带 fallback）
+            print(f"[FETCH_MODE=requests] 尝试 HTML 解析列表页...")
+            html = await self.fetch_page(self.NOTICE_LIST_URL, use_fallback=True)
             if html:
                 notices = self.parse_notice_list(html)
                 all_notices.extend(notices)
@@ -421,20 +357,12 @@ class PowerChinaCrawler:
         return all_notices
     
     async def crawl_notice_detail(self, notice: Dict) -> Optional[Dict]:
-        """
-        爬取单个公告详情
-        
-        参数:
-            notice: 公告基本信息（包含 url）
-        
-        返回:
-            完整的公告数据
-        """
+        """爬取单个公告详情（带 fallback）"""
         url = notice.get('url')
         if not url:
             return None
         
-        html = await self.fetch_page(url)
+        html = await self.fetch_page(url, use_fallback=True)
         if not html:
             return None
         
@@ -448,19 +376,25 @@ class PowerChinaCrawler:
 async def crawl_and_analyze(
     max_notices: int = 10,
     analyze: bool = True,
-    delay: float = 1.0
+    delay: float = 1.0,
+    save_to_db: bool = True
 ) -> List[Dict]:
     """
-    爬取并分析招标公告
+    爬取并分析招标公告，自动保存到数据库
     
     参数:
         max_notices: 最大爬取数量
         analyze: 是否使用 AI agent 分析
         delay: 请求延迟（秒）
+        save_to_db: 是否保存到数据库
     
     返回:
         包含分析和原始数据的列表
     """
+    # 初始化数据库
+    if save_to_db:
+        init_db()
+    
     results = []
     
     async with PowerChinaCrawler(delay=delay) as crawler:
@@ -473,11 +407,36 @@ async def crawl_and_analyze(
         for i, notice in enumerate(notices, 1):
             print(f"\n处理公告 {i}/{len(notices)}: {notice.get('title', 'N/A')[:50]}...")
             
+            # 检查是否已存在
+            if save_to_db:
+                existing = get_notice_by_url(notice.get('url', ''))
+                if existing and existing.raw_text:
+                    print(f"  公告已存在，跳过")
+                    continue
+            
+            # 爬取详情
             detail = await crawler.crawl_notice_detail(notice)
-            if not detail:
-                print(f"  跳过：无法获取详情")
+            if not detail or not detail.get('raw_text'):
+                print(f"  跳过：无法获取详情或正文为空")
                 continue
             
+            # 解析发布日期
+            published_at = None
+            if detail.get('publish_date'):
+                try:
+                    # 尝试解析日期
+                    date_str = detail['publish_date']
+                    for fmt in ['%Y-%m-%d', '%Y/%m/%d', '%Y-%m-%d %H:%M:%S']:
+                        try:
+                            published_at = datetime.strptime(date_str[:10], fmt[:10])
+                            break
+                        except:
+                            continue
+                except:
+                    pass
+            
+            # AI 分析
+            analysis_json = None
             if analyze:
                 try:
                     print(f"  进行 AI 分析...")
@@ -487,11 +446,26 @@ async def crawl_and_analyze(
                         raw_text=detail.get('raw_text', ''),
                         extracted_fields=detail.get('extracted_fields', {})
                     )
+                    analysis_json = analysis
                     detail['analysis'] = analysis
                     print(f"  分析完成: {analysis.get('fit_label')} ({analysis.get('fit_score')}/100)")
                 except Exception as e:
                     print(f"  AI 分析失败: {e}")
                     detail['analysis'] = None
+            
+            # 保存到数据库
+            if save_to_db:
+                try:
+                    save_notice(
+                        title=detail.get('title', ''),
+                        url=detail.get('url', ''),
+                        raw_text=detail.get('raw_text', ''),
+                        published_at=published_at,
+                        analysis_json=analysis_json
+                    )
+                    print(f"  已保存到数据库")
+                except Exception as e:
+                    print(f"  数据库保存失败: {e}")
             
             results.append(detail)
     
@@ -500,13 +474,7 @@ async def crawl_and_analyze(
 
 if __name__ == "__main__":
     async def test():
-        results = await crawl_and_analyze(max_notices=5, analyze=True)
+        results = await crawl_and_analyze(max_notices=5, analyze=True, save_to_db=True)
         print(f"\n\n共处理 {len(results)} 条公告")
-        for result in results:
-            print(f"\n标题: {result.get('title')}")
-            if result.get('analysis'):
-                analysis = result['analysis']
-                print(f"  评分: {analysis.get('fit_score')}/100")
-                print(f"  标签: {analysis.get('fit_label')}")
     
     asyncio.run(test())

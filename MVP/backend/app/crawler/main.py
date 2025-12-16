@@ -18,6 +18,7 @@ async def main():
     parser.add_argument('--no-analyze', action='store_true', help='不进行 AI 分析')
     parser.add_argument('--delay', type=float, default=1.0, help='请求延迟（秒）')
     parser.add_argument('--output', type=str, help='输出 JSON 文件路径')
+    parser.add_argument('--no-db', action='store_true', help='不保存到数据库')
     
     args = parser.parse_args()
     
@@ -33,7 +34,8 @@ async def main():
         results = await crawl_and_analyze(
             max_notices=args.max_notices,
             analyze=not args.no_analyze,
-            delay=args.delay
+            delay=args.delay,
+            save_to_db=not args.no_db
         )
         
         # 输出结果
