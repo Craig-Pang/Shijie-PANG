@@ -1,6 +1,7 @@
 """
 中国电建阳光采购网爬虫
 Pipeline: crawler -> extract -> hash去重 -> NEW/UPDATED -> analyze -> 入库
+支持 source_item_id 和 canonical_key
 """
 
 import re
@@ -13,8 +14,13 @@ from datetime import datetime
 from urllib.parse import urljoin
 
 from ..agent import analyze_notice
-from ..db import save_notice, get_notice_by_url, init_db
-from .powerchina_crawler_playwright import fetch_html_with_playwright, fetch_notice_list_with_playwright
+from ..db import save_notice, get_notice_by_canonical_key, init_db
+from .powerchina_crawler_playwright import (
+    fetch_html_with_playwright,
+    fetch_notice_list_with_playwright,
+    fetch_detail_with_playwright,
+    PlaywrightFetcher
+)
 
 
 class PowerChinaCrawler:
@@ -41,6 +47,14 @@ class PowerChinaCrawler:
         self.delay = delay
         self.use_playwright_fallback = use_playwright_fallback
         self.session: Optional[aiohttp.ClientSession] = None
+        # 统计信息
+        self.stats = {
+            'list_id_extracted': 0,
+            'list_id_failed': 0,
+            'detail_fetched': 0,
+            'detail_failed': 0,
+            'detail_fail_reasons': {}
+        }
     
     async def __aenter__(self):
         """异步上下文管理器入口"""
@@ -60,34 +74,75 @@ class PowerChinaCrawler:
         if self.session:
             await self.session.close()
     
+    def extract_source_item_id(self, row_element) -> Optional[str]:
+        """
+        从 DOM 元素中提取 source_item_id
+        
+        参数:
+            row_element: BeautifulSoup 行元素
+        
+        返回:
+            source_item_id 或 None
+        """
+        # 方法1: 查找 data-id 属性
+        item_id = row_element.get('data-id') or row_element.get('data-item-id') or row_element.get('data-notice-id')
+        if item_id:
+            return str(item_id)
+        
+        # 方法2: 从 onclick 中提取
+        onclick = row_element.get('onclick', '')
+        if onclick:
+            match = re.search(r"['\"](\d+)['\"]", onclick)
+            if match:
+                return match.group(1)
+        
+        # 方法3: 查找隐藏字段
+        hidden_inputs = row_element.find_all('input', type='hidden')
+        for input_elem in hidden_inputs:
+            name = input_elem.get('name', '').lower()
+            if 'id' in name:
+                value = input_elem.get('value')
+                if value:
+                    return str(value)
+        
+        return None
+    
+    def generate_canonical_key(self, source_item_id: Optional[str], index: int, title: str) -> str:
+        """
+        生成 canonical_key
+        
+        参数:
+            source_item_id: 源站项目ID
+            index: 列表序号
+            title: 标题
+        
+        返回:
+            canonical_key
+        """
+        if source_item_id:
+            return f"powerchina:{source_item_id}"
+        else:
+            # 使用列表序号 + 标题 hash
+            title_hash = hashlib.md5(title.encode('utf-8')).hexdigest()[:8]
+            return f"powerchina:index_{index}_hash_{title_hash}"
+    
     async def fetch_page(self, url: str, use_fallback: bool = True) -> Optional[Tuple[str, str]]:
         """
         获取网页内容（带 fallback）
-        
-        参数:
-            url: 目标 URL
-            use_fallback: 是否在失败时使用 Playwright fallback
-        
-        返回:
-            (html, final_url) 元组，失败返回 None
         """
-        # 首先尝试 requests 方式
         print(f"[FETCH_MODE=requests] 获取页面: {url}")
         html = await self._fetch_with_requests(url)
         
-        # 检查内容是否有效（SPA 页面通常 HTML 框架很小，需要检查是否有实际内容）
-        # 如果 HTML 很小（< 5000 字符），可能是空框架，需要 fallback
         if html and len(html) > 5000:
             print(f"[FETCH_MODE=requests] 成功获取 HTML ({len(html)} 字符)")
             return (html, url)
         
-        # 如果失败或内容过小，使用 Playwright fallback
         if (not html or len(html) <= 5000) and use_fallback and self.use_playwright_fallback:
             print(f"[FETCH_MODE=requests] 获取失败或内容为空，fallback 到 Playwright")
             result = await fetch_html_with_playwright(url, headless=True, timeout=60000, retries=2, debug=True)
             if result:
                 html, final_url = result
-                if html and len(html) > 1000:
+                if html and len(html) > 5000:
                     return (html, final_url)
         
         return None
@@ -154,7 +209,7 @@ class PowerChinaCrawler:
         return None
     
     def parse_api_response(self, data: Dict) -> List[Dict]:
-        """解析 API 响应数据，返回 [{title, url, published_at, html_or_text}]"""
+        """解析 API 响应数据，返回 [{title, url, source_item_id, canonical_key, published_at, html_or_text}]"""
         notices = []
         items = None
         
@@ -175,12 +230,22 @@ class PowerChinaCrawler:
         if not items:
             return notices
         
-        for item in items:
+        for idx, item in enumerate(items):
+            source_item_id = str(item.get('id') or item.get('noticeId') or item.get('tenderId') or '')
+            title = item.get('title') or item.get('noticeTitle') or item.get('name') or ''
+            
+            if not title:
+                continue
+            
+            canonical_key = self.generate_canonical_key(source_item_id, idx, title)
+            
             notice = {
-                'title': item.get('title') or item.get('noticeTitle') or item.get('name') or '',
+                'title': title,
                 'url': item.get('url') or item.get('link') or item.get('detailUrl') or '',
+                'source_item_id': source_item_id if source_item_id else None,
+                'canonical_key': canonical_key,
                 'published_at': None,
-                'html_or_text': item.get('content') or item.get('summary') or ''  # 如果有内容
+                'html_or_text': item.get('content') or item.get('summary') or ''
             }
             
             if notice['url'] and not notice['url'].startswith('http'):
@@ -200,131 +265,89 @@ class PowerChinaCrawler:
                 except:
                     pass
             
-            notice_id = item.get('id') or item.get('noticeId') or item.get('tenderId') or ''
-            if notice_id and not notice['url']:
-                notice['url'] = f"{self.BASE_URL}/consult/notice/{notice_id}"
+            if not notice['url'] and source_item_id:
+                notice['url'] = f"{self.BASE_URL}/consult/notice/{source_item_id}"
             
-            if notice.get('title') and notice.get('url'):
-                notices.append(notice)
+            notices.append(notice)
         
         return notices
     
     def parse_notice_list(self, html: str) -> List[Dict]:
         """
-        解析招标公告列表页，返回 [{title, url, published_at, html_or_text}]
+        解析招标公告列表页，返回 [{title, url, source_item_id, canonical_key, published_at, html_or_text}]
         """
         soup = BeautifulSoup(html, 'html.parser')
         notices = []
         
-        # 方法1: 查找包含公告的表格（通常有日期列）
+        # 查找包含公告的表格
         tables = soup.find_all('table')
         for table in tables:
             rows = table.find_all('tr')
             if len(rows) < 1:
                 continue
             
-            # 检查表格是否包含日期（可能是公告表格）
             table_text = table.get_text()
             has_date = bool(re.search(r'\d{4}[-/]\d{1,2}[-/]\d{1,2}', table_text))
             
-            if has_date and len(rows) > 5:  # 可能是公告列表表格
-                for row in rows:
+            if has_date and len(rows) > 5:
+                for idx, row in enumerate(rows):
                     cells = row.find_all(['td', 'th'])
-                    if len(cells) >= 2:
-                        # 第一列通常是标题
-                        title_cell = cells[0]
-                        title_link = title_cell.find('a', href=True)
-                        
-                        if title_link:
-                            title = title_link.get_text(strip=True)
-                            href = title_link.get('href')
-                            notice_url = urljoin(self.BASE_URL, href) if href else ''
-                        else:
-                            title = title_cell.get_text(strip=True)
-                            # 如果没有链接，尝试从标题生成 URL 或留空
-                            notice_url = ''
-                        
-                        # 第二列通常是日期
-                        date_cell = cells[1]
-                        date_text = date_cell.get_text(strip=True)
-                        date_match = re.search(r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})', date_text)
-                        
-                        published_at = None
-                        if date_match:
-                            date_str = date_match.group(1)
-                            for fmt in ['%Y-%m-%d', '%Y/%m/%d']:
-                                try:
-                                    published_at = datetime.strptime(date_str, fmt)
-                                    break
-                                except:
-                                    continue
-                        
-                        # 如果标题不为空且看起来像公告标题
-                        if title and len(title) > 10 and ('项目' in title or '招标' in title or '采购' in title or '工程' in title):
-                            notices.append({
-                                'title': title,
-                                'url': notice_url,
-                                'published_at': published_at,
-                                'html_or_text': ''
-                            })
-        
-        # 方法2: 如果方法1没找到，尝试查找所有带链接的行
-        if not notices:
-            table_rows = soup.find_all('tr')
-            for row in table_rows:
-                links = row.find_all('a', href=True)
-                if not links:
-                    continue
-                
-                notice = {
-                    'title': '',
-                    'url': '',
-                    'published_at': None,
-                    'html_or_text': ''
-                }
-                
-                title_link = links[0]
-                notice['title'] = title_link.get_text(strip=True)
-                notice['url'] = urljoin(self.BASE_URL, title_link['href'])
-                
-                # 提取日期
-                date_cells = row.find_all('td')
-                for cell in date_cells:
-                    text = cell.get_text(strip=True)
-                    date_match = re.search(r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})', text)
+                    if len(cells) < 2:
+                        continue
+                    
+                    # 提取 source_item_id
+                    source_item_id = self.extract_source_item_id(row)
+                    if source_item_id:
+                        self.stats['list_id_extracted'] += 1
+                    else:
+                        self.stats['list_id_failed'] += 1
+                    
+                    # 第一列通常是标题
+                    title_cell = cells[0]
+                    title_link = title_cell.find('a', href=True)
+                    
+                    if title_link:
+                        title = title_link.get_text(strip=True)
+                        href = title_link.get('href')
+                        notice_url = urljoin(self.BASE_URL, href) if href else ''
+                    else:
+                        title = title_cell.get_text(strip=True)
+                        notice_url = ''
+                    
+                    # 生成 canonical_key
+                    canonical_key = self.generate_canonical_key(source_item_id, idx, title)
+                    
+                    # 第二列通常是日期
+                    date_cell = cells[1]
+                    date_text = date_cell.get_text(strip=True)
+                    date_match = re.search(r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})', date_text)
+                    
+                    published_at = None
                     if date_match:
                         date_str = date_match.group(1)
                         for fmt in ['%Y-%m-%d', '%Y/%m/%d']:
                             try:
-                                notice['published_at'] = datetime.strptime(date_str, fmt)
+                                published_at = datetime.strptime(date_str, fmt)
                                 break
                             except:
                                 continue
-                        break
-                
-                if notice.get('title') and notice.get('url'):
-                    notices.append(notice)
+                    
+                    if title and len(title) > 10 and ('项目' in title or '招标' in title or '采购' in title or '工程' in title):
+                        notices.append({
+                            'title': title,
+                            'url': notice_url,
+                            'source_item_id': source_item_id,
+                            'canonical_key': canonical_key,
+                            'published_at': published_at,
+                            'html_or_text': ''
+                        })
         
         return notices
     
     def extract_raw_text(self, html: str) -> str:
-        """
-        从 HTML 提取纯文本（extract -> raw_text）
-        
-        参数:
-            html: HTML 内容
-        
-        返回:
-            纯文本内容
-        """
+        """从 HTML 提取纯文本"""
         soup = BeautifulSoup(html, 'html.parser')
         
-        # 提取标题
-        title_elem = soup.find(['h1', 'h2', 'h3'], class_=re.compile(r'title|head', re.I))
-        if not title_elem:
-            title_elem = soup.find('title')
-        
-        # 提取正文内容
         content_elem = soup.find(['div', 'article', 'section'], class_=re.compile(r'content|detail|main|body', re.I))
         if not content_elem:
             content_elem = soup.find('body')
@@ -338,7 +361,7 @@ class PowerChinaCrawler:
     
     async def crawl_notice_list(self, max_pages: int = 5) -> List[Dict]:
         """
-        爬取公告列表，返回 [{title, url, published_at, html_or_text}]
+        爬取公告列表，返回 [{title, url, source_item_id, canonical_key, published_at, html_or_text}]
         """
         all_notices = []
         
@@ -366,15 +389,6 @@ class PowerChinaCrawler:
                 if not page_notices:
                     break
         else:
-            # 首先尝试从 Playwright 获取列表（从 JS 变量）
-            if self.use_playwright_fallback:
-                js_list = await fetch_notice_list_with_playwright(
-                    self.NOTICE_LIST_URL, headless=True, timeout=60000, retries=2
-                )
-                if js_list:
-                    all_notices.extend(js_list)
-                    return all_notices
-            
             # 使用 HTML 解析（带 fallback）
             print(f"[FETCH_MODE=requests] 尝试 HTML 解析列表页...")
             result = await self.fetch_page(self.NOTICE_LIST_URL, use_fallback=True)
@@ -387,45 +401,74 @@ class PowerChinaCrawler:
     
     async def crawl_notice_detail(self, notice: Dict) -> Optional[Dict]:
         """
-        爬取单个公告详情，返回 {title, url, published_at, html_or_text}
+        爬取单个公告详情，返回 {title, url, source_item_id, canonical_key, published_at, html_or_text}
         """
-        url = notice.get('url')
-        if not url:
-            return None
-        
         # 如果已有 html_or_text，直接使用
         if notice.get('html_or_text'):
             return {
                 'title': notice.get('title', ''),
-                'url': url,
+                'url': notice.get('url', ''),
+                'source_item_id': notice.get('source_item_id'),
+                'canonical_key': notice.get('canonical_key', ''),
                 'published_at': notice.get('published_at'),
                 'html_or_text': notice.get('html_or_text')
             }
         
-        # 否则获取详情页
-        result = await self.fetch_page(url, use_fallback=True)
-        if not result:
-            return None
+        # 尝试获取详情
+        source_item_id = notice.get('source_item_id')
+        url = notice.get('url', '')
         
-        html, final_url = result
-        return {
-            'title': notice.get('title', ''),
-            'url': final_url,  # 使用最终 URL（可能被重定向）
-            'published_at': notice.get('published_at'),
-            'html_or_text': html
-        }
+        # 优先尝试推导接口或直接 URL
+        if url:
+            result = await self.fetch_page(url, use_fallback=True)
+            if result:
+                html, final_url = result
+                self.stats['detail_fetched'] += 1
+                return {
+                    'title': notice.get('title', ''),
+                    'url': final_url,
+                    'source_item_id': source_item_id,
+                    'canonical_key': notice.get('canonical_key', ''),
+                    'published_at': notice.get('published_at'),
+                    'html_or_text': html
+                }
+        
+        # 如果 URL 为空，使用详情获取器
+        if source_item_id:
+            print(f"[DETAIL_FETCHER] 尝试通过 ID 获取详情: {source_item_id}")
+            detail = await fetch_detail_with_playwright(
+                item_id=source_item_id,
+                row_selector=None,
+                list_url=self.NOTICE_LIST_URL,
+                base_url=self.BASE_URL,
+                headless=True,
+                timeout=60000
+            )
+            
+            if detail:
+                self.stats['detail_fetched'] += 1
+                return {
+                    'title': notice.get('title', ''),
+                    'url': '',  # URL 为空
+                    'source_item_id': source_item_id,
+                    'canonical_key': notice.get('canonical_key', ''),
+                    'published_at': notice.get('published_at'),
+                    'html_or_text': detail
+                }
+            else:
+                self.stats['detail_failed'] += 1
+                reason = "接口未捕获"
+                self.stats['detail_fail_reasons'][reason] = self.stats['detail_fail_reasons'].get(reason, 0) + 1
+        else:
+            self.stats['detail_failed'] += 1
+            reason = "无 source_item_id"
+            self.stats['detail_fail_reasons'][reason] = self.stats['detail_fail_reasons'].get(reason, 0) + 1
+        
+        return None
 
 
 def calculate_content_hash(raw_text: str) -> str:
-    """
-    计算内容 hash（用于去重）
-    
-    参数:
-        raw_text: 正文内容
-    
-    返回:
-        hash 字符串
-    """
+    """计算内容 hash（用于去重）"""
     return hashlib.md5(raw_text.encode('utf-8')).hexdigest()
 
 
@@ -439,64 +482,60 @@ async def crawl_and_analyze(
     完整的爬取和分析 pipeline
     
     Pipeline:
-    1. crawler 返回 [{title, url, published_at, html_or_text}]
+    1. crawler 返回 [{title, url, source_item_id, canonical_key, published_at, html_or_text}]
     2. extract -> raw_text
-    3. hash 去重/更新
+    3. hash 去重/更新（使用 canonical_key）
     4. NEW/UPDATED -> analyze_notice(...) -> analysis_json
     5. 写入数据库
-    
-    参数:
-        max_notices: 最大爬取数量
-        analyze: 是否使用 AI agent 分析
-        delay: 请求延迟（秒）
-        save_to_db: 是否保存到数据库
-    
-    返回:
-        处理结果列表
     """
-    # 初始化数据库
     if save_to_db:
         init_db()
     
     results = []
     
     async with PowerChinaCrawler(delay=delay) as crawler:
-        # Step 1: 爬取列表，返回 [{title, url, published_at, html_or_text}]
+        # Step 1: 爬取列表
         print(f"开始爬取招标公告列表...")
         notices = await crawler.crawl_notice_list(max_pages=3)
         print(f"找到 {len(notices)} 条公告")
+        
+        # 输出列表 ID 提取统计
+        total_list = crawler.stats['list_id_extracted'] + crawler.stats['list_id_failed']
+        if total_list > 0:
+            success_rate = (crawler.stats['list_id_extracted'] / total_list) * 100
+            print(f"[STATS] 列表 ID 提取: {crawler.stats['list_id_extracted']}/{total_list} ({success_rate:.1f}%)")
         
         notices = notices[:max_notices]
         
         for i, notice in enumerate(notices, 1):
             print(f"\n处理公告 {i}/{len(notices)}: {notice.get('title', 'N/A')[:50]}...")
+            print(f"  canonical_key: {notice.get('canonical_key', 'N/A')}")
+            print(f"  source_item_id: {notice.get('source_item_id', 'N/A')}")
             
             # Step 2: extract -> raw_text
             html_or_text = notice.get('html_or_text', '')
             if not html_or_text:
-                # 需要获取详情页
                 detail = await crawler.crawl_notice_detail(notice)
                 if not detail:
                     print(f"  跳过：无法获取详情")
                     continue
                 html_or_text = detail.get('html_or_text', '')
-                notice['url'] = detail.get('url', notice.get('url'))
+                notice.update(detail)
             
-            # 提取纯文本
             raw_text = crawler.extract_raw_text(html_or_text) if html_or_text else ''
             if not raw_text:
                 print(f"  跳过：无法提取正文")
                 continue
             
-            # Step 3: hash 去重/更新
+            # Step 3: hash 去重/更新（使用 canonical_key）
             content_hash = calculate_content_hash(raw_text)
+            canonical_key = notice.get('canonical_key', '')
             existing = None
             is_new = True
             
-            if save_to_db:
-                existing = get_notice_by_url(notice.get('url', ''))
+            if save_to_db and canonical_key:
+                existing = get_notice_by_canonical_key(canonical_key)
                 if existing:
-                    # 检查内容是否更新
                     existing_hash = calculate_content_hash(existing.raw_text or '')
                     if existing_hash == content_hash:
                         print(f"  公告内容未变化，跳过")
@@ -514,21 +553,21 @@ async def crawl_and_analyze(
                         title=notice.get('title', ''),
                         url=notice.get('url', ''),
                         raw_text=raw_text,
-                        extracted_fields={}  # 可以进一步提取字段
+                        extracted_fields={}
                     )
                     analysis_json = analysis
                     print(f"  分析完成: {analysis.get('fit_label')} ({analysis.get('fit_score')}/100)")
                 except Exception as e:
                     print(f"  AI 分析失败: {e}")
-                    import traceback
-                    traceback.print_exc()
             
             # Step 5: 写入数据库
-            if save_to_db:
+            if save_to_db and canonical_key:
                 try:
                     save_notice(
                         title=notice.get('title', ''),
+                        canonical_key=canonical_key,
                         url=notice.get('url', ''),
+                        source_item_id=notice.get('source_item_id'),
                         raw_text=raw_text,
                         published_at=notice.get('published_at'),
                         analysis_json=analysis_json
@@ -536,17 +575,27 @@ async def crawl_and_analyze(
                     print(f"  已保存到数据库 ({'新建' if is_new else '更新'})")
                 except Exception as e:
                     print(f"  数据库保存失败: {e}")
-                    import traceback
-                    traceback.print_exc()
             
             results.append({
                 'title': notice.get('title', ''),
                 'url': notice.get('url', ''),
+                'source_item_id': notice.get('source_item_id'),
+                'canonical_key': canonical_key,
                 'published_at': notice.get('published_at'),
                 'raw_text': raw_text[:200] + '...' if len(raw_text) > 200 else raw_text,
                 'analysis': analysis_json,
                 'is_new': is_new
             })
+        
+        # 输出详情获取统计
+        total_detail = crawler.stats['detail_fetched'] + crawler.stats['detail_failed']
+        if total_detail > 0:
+            success_rate = (crawler.stats['detail_fetched'] / total_detail) * 100
+            print(f"\n[STATS] 详情获取: {crawler.stats['detail_fetched']}/{total_detail} ({success_rate:.1f}%)")
+            if crawler.stats['detail_fail_reasons']:
+                print(f"[STATS] 失败原因:")
+                for reason, count in crawler.stats['detail_fail_reasons'].items():
+                    print(f"  - {reason}: {count}")
     
     return results
 

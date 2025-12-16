@@ -18,7 +18,9 @@ class Notice(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     title = Column(String(500), nullable=False, comment='公告标题')
-    url = Column(String(1000), unique=True, nullable=False, comment='公告链接')
+    url = Column(String(1000), comment='公告链接（可为空）')
+    source_item_id = Column(String(200), comment='源站项目ID')
+    canonical_key = Column(String(300), unique=True, nullable=False, comment='规范化唯一键（用于去重）')
     published_at = Column(DateTime, comment='发布日期')
     raw_text = Column(Text, comment='公告正文')
     analysis_json = Column(JSON, comment='AI 分析结果')
@@ -31,6 +33,8 @@ class Notice(Base):
             'id': self.id,
             'title': self.title,
             'url': self.url,
+            'source_item_id': self.source_item_id,
+            'canonical_key': self.canonical_key,
             'published_at': self.published_at.isoformat() if self.published_at else None,
             'raw_text': self.raw_text,
             'analysis_json': self.analysis_json,

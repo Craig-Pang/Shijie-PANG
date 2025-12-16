@@ -5,11 +5,15 @@
 ## 功能特性
 
 - ✅ 爬取招标公告列表
-- ✅ 爬取公告详情页
+- ✅ 爬取公告详情页（支持 URL 为空的情况）
+- ✅ **自动提取 source_item_id**（从 data-id/onclick/隐藏字段）
+- ✅ **生成 canonical_key**（用于去重，格式：powerchina:source_item_id）
+- ✅ **智能详情获取器**（优先推导接口，否则点击列表项）
 - ✅ 自动提取关键字段（地点、吨位、截止时间、资质要求等）
 - ✅ 集成 AI agent 自动分析适配度
 - ✅ **自动 fallback 到 Playwright**（当 requests 无法获取内容时）
-- ✅ 自动保存到数据库（notices 表）
+- ✅ 自动保存到数据库（notices 表，使用 canonical_key 去重）
+- ✅ **详细统计日志**（列表 ID 提取成功率、详情获取成功率、失败原因）
 - ✅ 支持分页爬取
 - ✅ 异步并发处理
 - ✅ 可配置请求延迟
@@ -119,14 +123,19 @@ asyncio.run(main())
 |------|------|------|
 | id | Integer | 主键 |
 | title | String | 公告标题 |
-| url | String | 公告链接（唯一） |
+| url | String | 公告链接（可为空） |
+| source_item_id | String | 源站项目ID |
+| canonical_key | String | 规范化唯一键（用于去重，格式：powerchina:source_item_id） |
 | published_at | DateTime | 发布日期 |
 | raw_text | Text | 公告正文 |
 | analysis_json | JSON | AI 分析结果 |
 | created_at | DateTime | 创建时间 |
 | updated_at | DateTime | 更新时间 |
 
-**注意**：如果公告已存在（根据 URL），会更新现有记录。
+**注意**：
+- 去重使用 `canonical_key` 作为主键，而不是 URL（因为某些网站列表页 URL 可能为空）
+- 如果公告已存在（根据 canonical_key），会更新现有记录
+- `source_item_id` 用于推导详情接口或点击获取详情
 
 ## 输出数据结构
 
@@ -237,6 +246,42 @@ html = await fetch_with_playwright(
 
 - `[FETCH_MODE=requests]`: 使用 requests 方式获取
 - `[FETCH_MODE=playwright]`: 使用 Playwright 方式获取
+- `[DETAIL_FETCHER]`: 详情获取器日志
 - `[DB]`: 数据库操作日志
+- `[STATS]`: 统计信息（列表 ID 提取成功率、详情获取成功率、失败原因）
 
-通过这些日志可以清楚地看到爬虫的工作流程。
+### 统计信息示例
+
+```
+[STATS] 列表 ID 提取: 15/20 (75.0%)
+[STATS] 详情获取: 18/20 (90.0%)
+[STATS] 失败原因:
+  - 接口未捕获: 1
+  - 无 source_item_id: 1
+```
+
+通过这些日志可以清楚地看到爬虫的工作流程和成功率。
+
+## 详情获取机制
+
+当列表页 URL 为空时，爬虫会使用智能详情获取器：
+
+1. **优先推导接口**：尝试以下 URL 模式：
+   - `/consult/notice/detail/{item_id}`
+   - `/api/consult/notice/detail/{item_id}`
+   - `/api/notice/detail/{item_id}`
+   - `/consult/api/notice/{item_id}`
+
+2. **点击获取**：如果接口失败，使用 Playwright 点击列表项：
+   - 点击列表行
+   - 等待详情区域/弹窗出现
+   - 提取详情文本
+
+3. **source_item_id 提取**：从以下位置提取：
+   - `data-id` / `data-item-id` / `data-notice-id` 属性
+   - `onclick` 事件参数（如 `onclick="viewDetail('123')"`）
+   - 隐藏字段（`<input type="hidden">`）
+
+4. **canonical_key 生成**：
+   - 如果有 `source_item_id`：`powerchina:{source_item_id}`
+   - 否则：`powerchina:index_{序号}_hash_{标题hash前8位}`
