@@ -75,13 +75,14 @@ class PowerChinaCrawler:
         print(f"[FETCH_MODE=requests] 获取页面: {url}")
         html = await self._fetch_with_requests(url)
         
-        # 检查内容是否有效
-        if html and len(html) > 1000:
+        # 检查内容是否有效（SPA 页面通常 HTML 框架很小，需要检查是否有实际内容）
+        # 如果 HTML 很小（< 5000 字符），可能是空框架，需要 fallback
+        if html and len(html) > 5000:
             print(f"[FETCH_MODE=requests] 成功获取 HTML ({len(html)} 字符)")
             return (html, url)
         
-        # 如果失败且启用 fallback，使用 Playwright
-        if (not html or len(html) <= 1000) and use_fallback and self.use_playwright_fallback:
+        # 如果失败或内容过小，使用 Playwright fallback
+        if (not html or len(html) <= 5000) and use_fallback and self.use_playwright_fallback:
             print(f"[FETCH_MODE=requests] 获取失败或内容为空，fallback 到 Playwright")
             result = await fetch_html_with_playwright(url, headless=True, timeout=60000, retries=2, debug=True)
             if result:
@@ -215,41 +216,94 @@ class PowerChinaCrawler:
         soup = BeautifulSoup(html, 'html.parser')
         notices = []
         
-        # 查找表格行
-        table_rows = soup.find_all('tr')
-        for row in table_rows:
-            links = row.find_all('a', href=True)
-            if not links:
+        # 方法1: 查找包含公告的表格（通常有日期列）
+        tables = soup.find_all('table')
+        for table in tables:
+            rows = table.find_all('tr')
+            if len(rows) < 1:
                 continue
             
-            notice = {
-                'title': '',
-                'url': '',
-                'published_at': None,
-                'html_or_text': ''
-            }
+            # 检查表格是否包含日期（可能是公告表格）
+            table_text = table.get_text()
+            has_date = bool(re.search(r'\d{4}[-/]\d{1,2}[-/]\d{1,2}', table_text))
             
-            title_link = links[0]
-            notice['title'] = title_link.get_text(strip=True)
-            notice['url'] = urljoin(self.BASE_URL, title_link['href'])
-            
-            # 提取日期
-            date_cells = row.find_all('td')
-            for cell in date_cells:
-                text = cell.get_text(strip=True)
-                date_match = re.search(r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})', text)
-                if date_match:
-                    date_str = date_match.group(1)
-                    for fmt in ['%Y-%m-%d', '%Y/%m/%d']:
-                        try:
-                            notice['published_at'] = datetime.strptime(date_str, fmt)
-                            break
-                        except:
-                            continue
-                    break
-            
-            if notice.get('title') and notice.get('url'):
-                notices.append(notice)
+            if has_date and len(rows) > 5:  # 可能是公告列表表格
+                for row in rows:
+                    cells = row.find_all(['td', 'th'])
+                    if len(cells) >= 2:
+                        # 第一列通常是标题
+                        title_cell = cells[0]
+                        title_link = title_cell.find('a', href=True)
+                        
+                        if title_link:
+                            title = title_link.get_text(strip=True)
+                            href = title_link.get('href')
+                            notice_url = urljoin(self.BASE_URL, href) if href else ''
+                        else:
+                            title = title_cell.get_text(strip=True)
+                            # 如果没有链接，尝试从标题生成 URL 或留空
+                            notice_url = ''
+                        
+                        # 第二列通常是日期
+                        date_cell = cells[1]
+                        date_text = date_cell.get_text(strip=True)
+                        date_match = re.search(r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})', date_text)
+                        
+                        published_at = None
+                        if date_match:
+                            date_str = date_match.group(1)
+                            for fmt in ['%Y-%m-%d', '%Y/%m/%d']:
+                                try:
+                                    published_at = datetime.strptime(date_str, fmt)
+                                    break
+                                except:
+                                    continue
+                        
+                        # 如果标题不为空且看起来像公告标题
+                        if title and len(title) > 10 and ('项目' in title or '招标' in title or '采购' in title or '工程' in title):
+                            notices.append({
+                                'title': title,
+                                'url': notice_url,
+                                'published_at': published_at,
+                                'html_or_text': ''
+                            })
+        
+        # 方法2: 如果方法1没找到，尝试查找所有带链接的行
+        if not notices:
+            table_rows = soup.find_all('tr')
+            for row in table_rows:
+                links = row.find_all('a', href=True)
+                if not links:
+                    continue
+                
+                notice = {
+                    'title': '',
+                    'url': '',
+                    'published_at': None,
+                    'html_or_text': ''
+                }
+                
+                title_link = links[0]
+                notice['title'] = title_link.get_text(strip=True)
+                notice['url'] = urljoin(self.BASE_URL, title_link['href'])
+                
+                # 提取日期
+                date_cells = row.find_all('td')
+                for cell in date_cells:
+                    text = cell.get_text(strip=True)
+                    date_match = re.search(r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})', text)
+                    if date_match:
+                        date_str = date_match.group(1)
+                        for fmt in ['%Y-%m-%d', '%Y/%m/%d']:
+                            try:
+                                notice['published_at'] = datetime.strptime(date_str, fmt)
+                                break
+                            except:
+                                continue
+                        break
+                
+                if notice.get('title') and notice.get('url'):
+                    notices.append(notice)
         
         return notices
     
