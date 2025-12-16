@@ -399,9 +399,13 @@ class PowerChinaCrawler:
         
         return all_notices
     
-    async def crawl_notice_detail(self, notice: Dict) -> Optional[Dict]:
+    async def crawl_notice_detail(self, notice: Dict, row_index: int = None) -> Optional[Dict]:
         """
         爬取单个公告详情，返回 {title, url, source_item_id, canonical_key, published_at, html_or_text}
+        
+        参数:
+            notice: 公告信息
+            row_index: 行索引（用于点击，如果没有 source_item_id）
         """
         # 如果已有 html_or_text，直接使用
         if notice.get('html_or_text'):
@@ -434,6 +438,7 @@ class PowerChinaCrawler:
                 }
         
         # 如果 URL 为空，使用详情获取器
+        # 优先尝试通过 ID
         if source_item_id:
             print(f"[DETAIL_FETCHER] 尝试通过 ID 获取详情: {source_item_id}")
             detail = await fetch_detail_with_playwright(
@@ -449,20 +454,41 @@ class PowerChinaCrawler:
                 self.stats['detail_fetched'] += 1
                 return {
                     'title': notice.get('title', ''),
-                    'url': '',  # URL 为空
+                    'url': '',
                     'source_item_id': source_item_id,
                     'canonical_key': notice.get('canonical_key', ''),
                     'published_at': notice.get('published_at'),
                     'html_or_text': detail
                 }
-            else:
-                self.stats['detail_failed'] += 1
-                reason = "接口未捕获"
-                self.stats['detail_fail_reasons'][reason] = self.stats['detail_fail_reasons'].get(reason, 0) + 1
-        else:
-            self.stats['detail_failed'] += 1
-            reason = "无 source_item_id"
-            self.stats['detail_fail_reasons'][reason] = self.stats['detail_fail_reasons'].get(reason, 0) + 1
+        
+        # 如果没有 source_item_id，尝试通过点击获取（使用行索引）
+        if row_index is not None:
+            print(f"[DETAIL_FETCHER] 尝试通过点击行 {row_index} 获取详情")
+            row_selector = f'tr.el-table__row:nth-child({row_index + 1})'  # +1 因为 CSS 从 1 开始
+            detail = await fetch_detail_with_playwright(
+                item_id=None,
+                row_selector=row_selector,
+                list_url=self.NOTICE_LIST_URL,
+                base_url=self.BASE_URL,
+                headless=True,
+                timeout=60000
+            )
+            
+            if detail:
+                self.stats['detail_fetched'] += 1
+                return {
+                    'title': notice.get('title', ''),
+                    'url': '',
+                    'source_item_id': source_item_id,
+                    'canonical_key': notice.get('canonical_key', ''),
+                    'published_at': notice.get('published_at'),
+                    'html_or_text': detail
+                }
+        
+        # 所有方法都失败
+        self.stats['detail_failed'] += 1
+        reason = "接口未捕获" if source_item_id else "无 source_item_id 且点击失败"
+        self.stats['detail_fail_reasons'][reason] = self.stats['detail_fail_reasons'].get(reason, 0) + 1
         
         return None
 
@@ -515,7 +541,8 @@ async def crawl_and_analyze(
             # Step 2: extract -> raw_text
             html_or_text = notice.get('html_or_text', '')
             if not html_or_text:
-                detail = await crawler.crawl_notice_detail(notice)
+                # 传递行索引用于点击（如果没有 source_item_id）
+                detail = await crawler.crawl_notice_detail(notice, row_index=i-1)
                 if not detail:
                     print(f"  跳过：无法获取详情")
                     continue

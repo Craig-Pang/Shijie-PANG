@@ -188,15 +188,38 @@ class PlaywrightFetcher:
             # 确保在列表页
             if self.page.url != list_url:
                 await self.page.goto(list_url, wait_until='networkidle', timeout=self.timeout)
-                await self.page.wait_for_timeout(1500)
+                await self.page.wait_for_timeout(2000)
             
-            # 点击行
-            print(f"[DETAIL_FETCHER] 点击列表项: {row_selector}")
-            await self.page.click(row_selector, timeout=10000)
-            await self.page.wait_for_timeout(2000)  # 等待详情加载
+            # 尝试多种点击方式
+            print(f"[DETAIL_FETCHER] 尝试点击列表项: {row_selector}")
             
-            # 尝试多种选择器查找详情区域
+            # 方法1: 直接点击行
+            try:
+                row_locator = self.page.locator(row_selector).first
+                await row_locator.click(timeout=5000)
+                await self.page.wait_for_timeout(2000)
+            except:
+                # 方法2: 点击行内的标题或链接
+                try:
+                    title_locator = self.page.locator(f'{row_selector} .title, {row_selector} a, {row_selector} .cell').first
+                    await title_locator.click(timeout=5000)
+                    await self.page.wait_for_timeout(2000)
+                except:
+                    print(f"[DETAIL_FETCHER] 点击失败，尝试其他方法")
+            
+            # 检查 URL 是否变化（可能跳转到详情页）
+            current_url = self.page.url
+            if current_url != list_url:
+                print(f"[DETAIL_FETCHER] 检测到 URL 变化: {current_url}")
+                html = await self.page.content()
+                if html and len(html) > 5000:
+                    print(f"[DETAIL_FETCHER] 从新页面获取详情 ({len(html)} 字符)")
+                    return html
+            
+            # 尝试多种选择器查找详情区域（弹窗或展开内容）
             detail_selectors = [
+                '.el-dialog__body',
+                '.el-drawer__body',
                 '.detail-content',
                 '.notice-detail',
                 '.content-detail',
@@ -204,12 +227,13 @@ class PlaywrightFetcher:
                 '[class*="content"]',
                 'article',
                 '.modal-body',
-                '.dialog-content'
+                '.dialog-content',
+                '.el-table__expanded-cell'
             ]
             
             for selector in detail_selectors:
                 try:
-                    detail_elem = await self.page.wait_for_selector(selector, timeout=3000, state='visible')
+                    detail_elem = await self.page.wait_for_selector(selector, timeout=2000, state='visible')
                     if detail_elem:
                         detail_text = await detail_elem.inner_text()
                         if detail_text and len(detail_text) > 100:
@@ -218,9 +242,10 @@ class PlaywrightFetcher:
                 except:
                     continue
             
-            # 如果没找到详情区域，获取整个页面内容
+            # 如果没找到详情区域，获取整个页面内容（可能详情已展开）
             html = await self.page.content()
-            if html and len(html) > 5000:
+            # 检查页面是否包含更多内容（相比列表页）
+            if html and len(html) > 100000:  # 详情页通常比列表页大
                 print(f"[DETAIL_FETCHER] 从页面获取详情 ({len(html)} 字符)")
                 return html
             
@@ -229,6 +254,8 @@ class PlaywrightFetcher:
             
         except Exception as e:
             print(f"[DETAIL_FETCHER] 点击获取详情失败: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
 
