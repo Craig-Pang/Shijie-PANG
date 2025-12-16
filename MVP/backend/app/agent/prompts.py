@@ -68,7 +68,7 @@ def build_analysis_prompt(
 标题：{title}
 {fields_text}
 正文：
-{raw_text[:3000]}  # 限制长度避免过长
+{raw_text[:3000]}
 
 ## 任务要求
 1. 基于规则评分结果，结合招标公告内容，给出最终适配度评分（0-100）
