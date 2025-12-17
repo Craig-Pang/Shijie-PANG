@@ -583,7 +583,16 @@ async def crawl_and_analyze(
                         extracted_fields={}
                     )
                     analysis_json = analysis
-                    print(f"  分析完成: {analysis.get('fit_label')} ({analysis.get('fit_score')}/100)")
+                    # 显示分析结果（支持新的决策状态）
+                    decision_state = analysis.get('decision_state', analysis.get('fit_label', 'UNKNOWN'))
+                    fit_score = analysis.get('fit_score')
+                    fit_label = analysis.get('fit_label', 'UNKNOWN')
+                    input_quality = analysis.get('_meta', {}).get('input_quality', 'UNKNOWN')
+                    decision_source = analysis.get('_meta', {}).get('decision_source', 'UNKNOWN')
+                    
+                    score_str = f"{fit_score}/100" if fit_score is not None else "null"
+                    print(f"  分析完成: {decision_state} ({score_str})")
+                    print(f"    输入质量: {input_quality}, 决策来源: {decision_source}")
                 except Exception as e:
                     print(f"  AI 分析失败: {e}")
             

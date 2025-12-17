@@ -235,3 +235,45 @@ def rule_score(
     
     return total_score, reasons, risk_flags
 
+
+def is_clearly_mismatched(
+    rule_score: int,
+    rule_reasons: List[str],
+    rule_risk_flags: List[str]
+) -> Tuple[bool, str]:
+    """
+    判断规则是否明确判定为"不匹配"
+    
+    参数:
+        rule_score: 规则评分
+        rule_reasons: 规则评分原因
+        rule_risk_flags: 规则风险提示
+    
+    返回:
+        (is_mismatched, reason)
+        is_mismatched: True 表示明确不匹配，False 表示不确定
+        reason: 判断原因
+    """
+    # 明确不匹配的条件：
+    # 1. 规则评分极低（< 10 分）
+    # 2. 且至少有一个明确的负面风险提示
+    
+    if rule_score < 10 and rule_risk_flags:
+        # 检查是否有明确的负面提示（不是"信息不足"类的）
+        negative_flags = [
+            "地域不在优先范围内",
+            "规模不在目标范围",
+            "项目类型或业务范围匹配度较低",
+            "资质要求可能不完全匹配"
+        ]
+        if any(flag in rule_risk_flags for flag in negative_flags):
+            return (True, f"规则评分极低（{rule_score}分）且存在明确负面风险提示")
+    
+    # 如果规则评分很低但原因明确（不是"未匹配到"这种模糊表述）
+    if rule_score < 20:
+        if "未匹配到明显适配条件" not in " ".join(rule_reasons):
+            # 有具体的不匹配原因
+            return (True, f"规则评分低（{rule_score}分）且有明确不匹配原因")
+    
+    return (False, "规则未明确判定为不匹配")
+

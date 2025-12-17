@@ -3,7 +3,7 @@
 """
 
 from pydantic import BaseModel, Field
-from typing import List, Dict, Literal
+from typing import List, Dict, Literal, Optional
 
 
 class KeyFields(BaseModel):
@@ -17,8 +17,15 @@ class KeyFields(BaseModel):
 
 class TenderAnalysisResult(BaseModel):
     """招标分析结果"""
-    fit_score: int = Field(ge=0, le=100, description="适配度评分 0-100")
-    fit_label: Literal["RECOMMEND", "REVIEW", "SKIP"] = Field(description="推荐标签")
+    decision_state: Literal["RECOMMEND", "REVIEW", "SKIP", "UNKNOWN"] = Field(
+        description="决策状态：RECOMMEND(明确匹配)、REVIEW(需复核)、SKIP(明确不匹配)、UNKNOWN(信息不足)"
+    )
+    fit_label: Literal["RECOMMEND", "REVIEW", "SKIP", "UNKNOWN"] = Field(
+        description="推荐标签（兼容 decision_state）"
+    )
+    fit_score: Optional[int] = Field(
+        default=None, ge=0, le=100, description="适配度评分 0-100（UNKNOWN 时为 null）"
+    )
     region_match: Literal["HIGH", "MED", "LOW", "UNKNOWN"] = Field(description="地域匹配度")
     scope_match: Literal["HIGH", "MED", "LOW", "UNKNOWN"] = Field(description="范围匹配度")
     scale_match: Literal["HIGH", "MED", "LOW", "UNKNOWN"] = Field(description="规模匹配度")
@@ -29,11 +36,12 @@ class TenderAnalysisResult(BaseModel):
     key_fields: KeyFields = Field(default_factory=KeyFields, description="关键字段")
 
 
-def create_fallback_result() -> Dict:
+def create_fallback_result(decision_source: str = "FALLBACK") -> Dict:
     """创建 fallback 结果（当 LLM 输出无效时）"""
     return {
-        "fit_score": 50,
+        "decision_state": "REVIEW",
         "fit_label": "REVIEW",
+        "fit_score": 50,
         "region_match": "UNKNOWN",
         "scope_match": "UNKNOWN",
         "scale_match": "UNKNOWN",
@@ -47,6 +55,9 @@ def create_fallback_result() -> Dict:
             "deadline": "",
             "tonnage": "",
             "qualification": ""
+        },
+        "_meta": {
+            "decision_source": decision_source
         }
     }
 
